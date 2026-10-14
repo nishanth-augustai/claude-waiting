@@ -12,7 +12,7 @@ after finishing. It plays a sound on arrival. ✕ dismisses it. The arrow button
 Needs Xcode command line tools, `jq`, and the `code` CLI.
 
 ```sh
-git clone <this repo> ~/claude-waiting-widget
+git clone https://github.com/nishanth-augustai/claude-waiting.git ~/claude-waiting-widget
 ~/claude-waiting-widget/install.sh
 ```
 
