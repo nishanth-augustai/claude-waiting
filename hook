@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# claude-waiting-hook <event> — Claude Code hook. Keeps ~/.claude-waiting in sync for the
+# top-left widget and names the terminal tab so the widget can jump straight to it.
+set -u
+DIR="$HOME/.claude-waiting"
+mkdir -p "$DIR"
+event="${1:-}"
+input="$(cat)"
+sid="$(jq -r '.session_id // empty' <<<"$input")"
+[ -z "$sid" ] && exit 0
+file="$DIR/$sid.json"
+
+cwd="$(jq -r '.cwd // empty' <<<"$input")"
+folder="$(basename "${cwd:-unknown}")"
+# Hooks run with no terminal attached, so ask the claude process (or its parents) for its tty.
+tty=""
+for p in "${CLAUDE_PID:-}" $PPID $(ps -o ppid= -p $PPID) ; do
+    [ -z "$p" ] && continue
+    t="$(ps -o tty= -p "$p" 2>/dev/null | tr -d ' ')"
+    case "$t" in ttys*) tty="$t"; break ;; esac
+done
+if [ "${CLAUDE_CODE_ENTRYPOINT:-}" = "claude-desktop" ]; then kind=app
+elif [ "${TERM_PROGRAM:-}" = "vscode" ]; then kind=vscode
+else kind="${TERM_PROGRAM:-terminal}"; fi
+# Claude's own session name (auto or /rename) reads better than the folder; "derived" ones are just folder+hash.
+name="$(jq -r 'select(.nameSource != "derived") | .name // empty' "$HOME/.claude/sessions/${CLAUDE_PID:-0}.json" 2>/dev/null)"
+[ -z "$name" ] && name="$folder"
+tab_id=""; [ -n "$tty" ] && tab_id="s${tty#ttys}"
+label="$name"; [ -n "$tab_id" ] && label="$name #$tab_id"
+
+echo "$(date +%T) $event tty=$tty kind=$kind label=$label entry=${CLAUDE_CODE_ENTRYPOINT:-} term=${TERM_PROGRAM:-}" >> "$DIR/hook.log"
+
+set_title() { [ -n "$tty" ] && printf '\033]0;%s\007' "$1" > "/dev/$tty" 2>/dev/null; return 0; }
+
+case "$event" in
+    start|end)
+        rm -f "$file"; set_title "$label"; exit 0 ;;
+    prompt|answered)
+        rm -f "$file"; set_title "⏳ $label"; exit 0 ;;
+    stop)
+        reason=done; snippet="$(jq -r '.last_assistant_message // ""' <<<"$input")" ;;
+    question)
+        reason=question; snippet="$(jq -r '.tool_input.questions[0].question // ""' <<<"$input")" ;;
+    notify)
+        snippet="$(jq -r '.message // ""' <<<"$input")"
+        case "$(jq -r '.notification_type // ""' <<<"$input")" in
+            permission_prompt) reason=permission ;;
+            elicitation_dialog) reason=question ;;
+            idle_prompt) [ -f "$file" ] && exit 0; reason=idle ;;
+            *) exit 0 ;;
+        esac ;;
+    *) exit 0 ;;
+esac
+
+# App sessions have their own id; the app stores the mapping. No mapping = a background run, not a chat.
+app_id=""
+if [ "$kind" = app ]; then
+    app_file="$(grep -lE "\"cliSessionId\": ?\"$sid\"" "$HOME/Library/Application Support/Claude/claude-code-sessions"/*/*/local_*.json 2>/dev/null | head -1)"
+    [ -z "$app_file" ] && exit 0
+    app_id="$(jq -r '.sessionId // empty' "$app_file")"
+fi
+
+transcript="$(jq -r '.transcript_path // empty' <<<"$input")"
+title="$(head -c 300000 "$transcript" 2>/dev/null \
+    | jq -r 'select(.type=="user") | .message.content | if type=="string" then . else ((map(select(.type=="text"))[0].text) // "") end' 2>/dev/null \
+    | grep -v '^\s*$' | head -1 | cut -c1-90)"
+snippet="$(tr '\n' ' ' <<<"$snippet" | tr -s ' ' | sed 's/ *$//' | cut -c1-160)"
+
+jq -n --arg sid "$sid" --arg kind "$kind" --arg cwd "$cwd" --arg folder "$folder" --arg tty "$tty" \
+      --arg label "$label" --arg name "$name" --arg tab_id "$tab_id" --arg app_id "$app_id" --arg reason "$reason" --arg title "$title" --arg snippet "$snippet" \
+      '{session_id:$sid, kind:$kind, cwd:$cwd, folder:$folder, tty:$tty, label:$label, name:$name, tab_id:$tab_id, app_id:$app_id, reason:$reason, title:$title, snippet:$snippet, at:now}' \
+      > "$file.tmp" && mv "$file.tmp" "$file"
+case "$reason" in done|idle) set_title "✅ $label" ;; *) set_title "❓ $label" ;; esac

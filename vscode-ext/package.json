@@ -1,0 +1,10 @@
+{
+    "name": "claude-waiting-focus",
+    "displayName": "Claude Waiting: focus terminal",
+    "description": "Lets the Claude Waiting widget bring a terminal tab to the front by its tty.",
+    "version": "1.0.1",
+    "publisher": "nishanth",
+    "engines": { "vscode": "^1.80.0" },
+    "main": "./extension.js",
+    "activationEvents": ["onStartupFinished"]
+}
