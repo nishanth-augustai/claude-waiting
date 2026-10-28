@@ -253,7 +253,7 @@ final class HoverButton: NSButton {
         for (key, from, to) in [("backgroundColor", l.presentation()?.backgroundColor ?? l.backgroundColor, bg as Any),
                                 ("transform", l.presentation()?.transform ?? l.transform, t as Any)] {
             let a = CABasicAnimation(keyPath: key)
-            a.fromValue = from
+            a.fromValue = from as Any?
             a.toValue = to
             a.duration = 0.14
             a.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0, 0, 1)
@@ -277,8 +277,8 @@ let t0 = Date()
 let dlog = { (s: String) in if DEBUG { print(String(format: "%7.3f ", Date().timeIntervalSince(t0)) + s) } }
 var frameNo = 0
 let captureFrame = { (panel: NSPanel) in
-    guard panel.isVisible, let cg = CGWindowListCreateImage(.null, .optionIncludingWindow, CGWindowID(panel.windowNumber), [.boundsIgnoreFraming]) else { return }
-    let rep = NSBitmapImageRep(cgImage: cg)
+    guard panel.isVisible, let view = panel.contentView, let rep = view.bitmapImageRepForCachingDisplay(view.bounds) else { return }
+    view.cacheDisplay(in: view.bounds, to: rep)
     guard let png = rep.representation(using: .png, properties: [:]) else { return }
     let dir = DIR + "/frames"
     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
