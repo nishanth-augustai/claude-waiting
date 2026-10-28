@@ -16,7 +16,7 @@ let prefs = UserDefaults.standard
 var style: String { prefs.string(forKey: "style") ?? "default" } // "default" | "compact" | "art"
 var boldOutline: Bool { prefs.bool(forKey: "boldOutline") }
 var outlineColor: NSColor { colorFromHex(prefs.string(forKey: "outlineColor") ?? "#4A9EFF") }
-var restH: CGFloat { style == "compact" ? 52 : style == "art" ? 150 : 128 } // card height before hover
+var restH: CGFloat { style == "compact" ? 52 : style == "art" ? 150 : 132 } // card height before hover
 
 let colorFromHex = { (hex: String) -> NSColor in
     let h = hex.hasPrefix("#") ? String(hex.dropFirst()) : hex
@@ -159,7 +159,8 @@ let wrapped = { (text: String, font: NSFont, color: NSColor, frame: NSRect) -> N
     l.frame = frame
     l.isSelectable = false
     l.maximumNumberOfLines = 4
-    l.lineBreakMode = .byTruncatingTail
+    l.lineBreakMode = .byWordWrapping
+    l.cell?.truncatesLastVisibleLine = true
     return l
 }
 
@@ -170,9 +171,23 @@ let textHeight = { (text: String, f: NSFont, width: CGFloat, maxLines: Int) -> C
     return min(ceil(r.height), line * CGFloat(maxLines)) + 2
 }
 
-// A card that tells the widget when the pointer enters or leaves it, even while the app is inactive.
+// A card keeps its views between renders. Motion is driven by the widget's ticker: every frame the current
+// values move a fraction of the way to the targets, so a new target mid-motion never snaps. y runs from the top.
 final class CardView: NSView {
+    let sessionId: String
     var onHover: (() -> Void)?
+    var restH: CGFloat = 0
+    var extraH: CGFloat = 0
+    var reveal: [NSView] = []              // visible only while unfolded
+    var hide: [NSView] = []                // visible only while folded
+    var bottom: [(NSView, CGFloat)] = []   // anchored to the bottom edge: (view, distance from its top to the bottom)
+    var openButton: NSButton? = nil
+    var curY: CGFloat = 0, curH: CGFloat = 0, curReveal: CGFloat = 0, curAlpha: CGFloat = 0
+    var targetY: CGFloat = 0, targetH: CGFloat = 0, targetReveal: CGFloat = 0, targetAlpha: CGFloat = 1
+    var targetAt: TimeInterval = 0         // the wave: cards below the unfolded one start a little later
+    init(sessionId: String) { self.sessionId = sessionId; super.init(frame: .zero) }
+    required init?(coder: NSCoder) { nil }
+    override var isFlipped: Bool { true }
     override func updateTrackingAreas() {
         trackingAreas.forEach(removeTrackingArea)
         addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil))
@@ -180,12 +195,59 @@ final class CardView: NSView {
     }
     override func mouseEntered(with event: NSEvent) { onHover?() }
     override func mouseExited(with event: NSEvent) { onHover?() }
+    // Faded-out buttons must not catch clicks meant for the card.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let v = super.hitTest(point)
+        if let v = v, v !== self, v.alphaValue < 0.5 { return openButton }
+        return v
+    }
+    func jump() { curY = targetY; curH = targetH; curReveal = targetReveal; curAlpha = targetAlpha; render() }
+    // One frame of motion. Returns true while anything is still moving.
+    func step(_ now: TimeInterval) -> Bool {
+        if now < targetAt { return true }
+        let k: CGFloat = 0.22
+        var moving = false
+        let pull = { (cur: inout CGFloat, target: CGFloat) in
+            if abs(target - cur) < 0.3 { cur = target } else { cur += (target - cur) * k; moving = true }
+        }
+        pull(&curY, targetY); pull(&curH, targetH); pull(&curReveal, targetReveal); pull(&curAlpha, targetAlpha)
+        render()
+        return moving
+    }
+    func render() {
+        frame = NSRect(x: 0, y: curY, width: WIDTH, height: curH)
+        alphaValue = curAlpha
+        // Buttons and the long text live in the second half of the unfold, so they are gone early on the way back.
+        let late = max(0, min(1, (curReveal - 0.5) * 2))
+        for v in reveal { v.alphaValue = late }
+        for v in hide { v.alphaValue = 1 - late }
+        for (v, d) in bottom { v.frame.origin.y = curH - d }
+    }
 }
+
+final class FlippedView: NSView { override var isFlipped: Bool { true } }
 
 let PINK = NSColor(red: 1, green: 0.42, blue: 0.62, alpha: 1)
 let GREY = NSColor.white.withAlphaComponent(0.55)
 let DIM = NSColor.white.withAlphaComponent(0.4)
 let BODY = NSColor(white: 0.11, alpha: 1)
+
+// Debugging: CLAUDE_WAITING_DEBUG=1 prints every hover/layout step; CLAUDE_WAITING_CAPTURE=1 also saves the
+// panel to ~/.claude-waiting/frames/ 25 times a second so the motion can be inspected frame by frame.
+let DEBUG = ProcessInfo.processInfo.environment["CLAUDE_WAITING_DEBUG"] != nil
+let CAPTURE = ProcessInfo.processInfo.environment["CLAUDE_WAITING_CAPTURE"] != nil
+let t0 = Date()
+let dlog = { (s: String) in if DEBUG { print(String(format: "%7.3f ", Date().timeIntervalSince(t0)) + s) } }
+var frameNo = 0
+let captureFrame = { (panel: NSPanel) in
+    guard panel.isVisible, let cg = CGWindowListCreateImage(.null, .optionIncludingWindow, CGWindowID(panel.windowNumber), [.boundsIgnoreFraming]) else { return }
+    let rep = NSBitmapImageRep(cgImage: cg)
+    guard let png = rep.representation(using: .png, properties: [:]) else { return }
+    let dir = DIR + "/frames"
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    frameNo += 1
+    FileManager.default.createFile(atPath: dir + String(format: "/%04d_%.3f.png", frameNo, Date().timeIntervalSince(t0)), contents: png)
+}
 
 // ---- one-time setup for a downloaded copy: hooks into ~/.claude/settings.json, VS Code extension ----
 
@@ -268,11 +330,14 @@ let setup = { () -> String in
 final class Widget: NSObject, NSApplicationDelegate {
     let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: WIDTH, height: 134),
                         styleMask: [.nonactivatingPanel, .borderless, .utilityWindow], backing: .buffered, defer: false)
-    let content = NSView()
+    let content = FlippedView()
+    var ticker: Timer? = nil
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     var shown: [Waiting] = []
     var visible: Set<String> = []
     var hoveredId: String? = nil
+    var cards: [String: CardView] = [:]
+    var keys: [String: String] = [:]
 
     func applicationDidFinishLaunching(_: Notification) {
         panel.level = .floating
@@ -288,6 +353,7 @@ final class Widget: NSObject, NSApplicationDelegate {
         statusItem.button?.image = NSImage(systemSymbolName: "bell.badge", accessibilityDescription: "Claude Waiting")
         buildMenu()
         Timer.scheduledTimer(withTimeInterval: POLL_SECONDS, repeats: true) { _ in self.refresh() }
+        if CAPTURE { Timer.scheduledTimer(withTimeInterval: 0.04, repeats: true) { _ in captureFrame(self.panel) } }
         refresh()
         if !hooksInstalled() && !prefs.bool(forKey: "setupOffered") {
             prefs.set(true, forKey: "setupOffered")
@@ -318,11 +384,12 @@ final class Widget: NSObject, NSApplicationDelegate {
         statusItem.menu = m
     }
 
-    @objc func styleDefault() { prefs.set("default", forKey: "style"); buildMenu(); render() }
-    @objc func styleCompact() { prefs.set("compact", forKey: "style"); buildMenu(); render() }
-    @objc func styleArt() { prefs.set("art", forKey: "style"); buildMenu(); render() }
-    @objc func outlineThin() { prefs.set(false, forKey: "boldOutline"); buildMenu(); render() }
-    @objc func outlineBold() { prefs.set(true, forKey: "boldOutline"); buildMenu(); render() }
+    func settingsChanged() { buildMenu(); if sync() { place(animated: false) } }
+    @objc func styleDefault() { prefs.set("default", forKey: "style"); settingsChanged() }
+    @objc func styleCompact() { prefs.set("compact", forKey: "style"); settingsChanged() }
+    @objc func styleArt() { prefs.set("art", forKey: "style"); settingsChanged() }
+    @objc func outlineThin() { prefs.set(false, forKey: "boldOutline"); settingsChanged() }
+    @objc func outlineBold() { prefs.set(true, forKey: "boldOutline"); settingsChanged() }
     @objc func toggleLogin() {
         if SMAppService.mainApp.status == .enabled { try? SMAppService.mainApp.unregister() } else { try? SMAppService.mainApp.register() }
         buildMenu()
@@ -340,8 +407,7 @@ final class Widget: NSObject, NSApplicationDelegate {
     @objc func colorChanged(_ p: NSColorPanel) {
         prefs.set(hexFromColor(p.color), forKey: "outlineColor")
         prefs.set(true, forKey: "boldOutline")
-        buildMenu()
-        render()
+        settingsChanged()
     }
     @objc func installClicked() {
         NSApp.activate(ignoringOtherApps: true)
@@ -357,39 +423,35 @@ final class Widget: NSObject, NSApplicationDelegate {
         done.runModal()
     }
 
-    // How much taller a card gets on hover: the snippet unfolds, and Compact also gains a row of buttons.
-    func extra(_ w: Waiting) -> CGFloat {
-        let detail = w.snippet.isEmpty ? w.title : w.snippet
-        switch style {
-        case "compact": return max(0, textHeight(detail, font(12, false), WIDTH - 46, 4) - 15) + 40
-        case "art": return 0
-        default: return max(0, textHeight(detail, font(12, false), WIDTH - 32, 4) - 16)
-        }
-    }
-
-    // Cards are stacked top-down from the panel's top edge; the panel keeps its top where the user dragged it.
-    func layout() -> (left: CGFloat, top: CGFloat, tops: [CGFloat], stackH: CGFloat) {
+    // Rest positions, top-down from the panel's top edge; the panel keeps its top where the user dragged it.
+    func layout() -> (left: CGFloat, top: CGFloat, tops: [CGFloat]) {
         let screen = (NSScreen.main ?? NSScreen.screens[0]).visibleFrame
         let left = panel.isVisible ? panel.frame.minX : screen.minX + MARGIN
         let top = panel.isVisible ? panel.frame.maxY : screen.maxY - MARGIN
         var tops: [CGFloat] = []
         var t: CGFloat = 0
         for _ in shown { tops.append(t); t += restH + GAP }
-        return (left, top, tops, max(t - GAP, 0))
+        return (left, top, tops)
     }
 
     // Hover is read from the pointer position, not tracked state, so a rebuild never gets it wrong.
-    func hoveredIndex(_ L: (left: CGFloat, top: CGFloat, tops: [CGFloat], stackH: CGFloat)) -> Int? {
+    // The gap between two cards counts as still hovering the last one, so crossing it does not fold and unfold.
+    func hoveredIndex() -> Int? {
+        let L = layout()
         let mouse = NSEvent.mouseLocation
         let rect = { (i: Int, h: CGFloat) in NSRect(x: L.left, y: L.top - L.tops[i] - h, width: WIDTH, height: h) }
-        if let id = hoveredId, let i = shown.firstIndex(where: { $0.sessionId == id }), rect(i, restH + extra(shown[i])).contains(mouse) { return i }
-        return shown.indices.first { rect($0, restH).contains(mouse) }
+        let prev = hoveredId.flatMap { id in shown.firstIndex { $0.sessionId == id } }
+        if let i = prev, let c = cards[shown[i].sessionId], rect(i, c.restH + c.extraH).contains(mouse) { return i }
+        if let i = shown.indices.first(where: { rect($0, restH).contains(mouse) }) { return i }
+        if prev != nil, panel.frame.contains(mouse) { return prev }
+        return nil
     }
 
     func hoverChanged() {
         guard !shown.isEmpty else { return }
-        let i = hoveredIndex(layout())
-        if i.map({ shown[$0].sessionId }) != hoveredId { render() }
+        let h = hoveredIndex().map { shown[$0].sessionId }
+        dlog("hoverChanged -> \(h?.prefix(8) ?? "none") (was \(hoveredId?.prefix(8) ?? "none"))")
+        if h != hoveredId { place(animated: true) }
     }
 
     func refresh() {
@@ -398,34 +460,87 @@ final class Widget: NSObject, NSApplicationDelegate {
         fresh.forEach(setTabTitle)
         if !fresh.isEmpty { NSSound(named: SOUND)?.play() }
         visible = Set(shown.map { $0.sessionId })
-        render()
+        if sync() { place(animated: true) }
     }
 
-    func render() {
-        if shown.isEmpty { panel.orderOut(nil); hoveredId = nil; return }
-        let L = layout()
-        let hovered = hoveredIndex(L)
-        hoveredId = hovered.map { shown[$0].sessionId }
-        var height = L.stackH
-        if let i = hovered { height = max(height, L.tops[i] + restH + extra(shown[i])) }
-        panel.setFrame(NSRect(x: L.left, y: L.top - height, width: WIDTH, height: height), display: true)
-        content.subviews.forEach { $0.removeFromSuperview() }
-        var hoveredView: NSView? = nil
-        for (i, w) in shown.enumerated() {
-            let h = restH + (i == hovered ? extra(w) : 0)
-            let v = card(w, index: i, hovered: i == hovered, height: h)
-            v.frame = NSRect(x: 0, y: height - L.tops[i] - h, width: WIDTH, height: h)
-            content.addSubview(v)
-            if i == hovered { hoveredView = v }
+    // Rebuild only the cards whose content changed. Returns true if anything did.
+    func sync() -> Bool {
+        var changed = false
+        let ids = Set(shown.map { $0.sessionId })
+        for id in cards.keys where !ids.contains(id) {
+            cards[id]?.removeFromSuperview()
+            cards[id] = nil
+            keys[id] = nil
+            changed = true
         }
-        // The unfolded card draws over the one below it instead of pushing it down.
-        if let v = hoveredView { content.addSubview(v, positioned: .above, relativeTo: nil) }
-        panel.orderFrontRegardless()
-        if ProcessInfo.processInfo.environment["CLAUDE_WAITING_DEBUG"] != nil { print("rows:", shown.count, "hover:", hovered ?? -1, "frame:", panel.frame) }
+        for w in shown {
+            let key = [w.reason, w.snippet, w.name, w.title, w.folder, sessionName(w.sessionId), "\(Int(Date().timeIntervalSince(w.at) / 60))",
+                       style, boldOutline ? "b" : "t", hexFromColor(outlineColor)].joined(separator: "|")
+            if keys[w.sessionId] == key { continue }
+            let c = card(w)
+            if let old = cards[w.sessionId] {
+                // A rebuilt card picks up where the old one was, so a minute ticking over is invisible.
+                (c.curY, c.curH, c.curReveal, c.curAlpha) = (old.curY, old.curH, old.curReveal, old.curAlpha)
+                c.render()
+                old.removeFromSuperview()
+            }
+            content.addSubview(c)
+            cards[w.sessionId] = c
+            keys[w.sessionId] = key
+            dlog("rebuilt card \(w.sessionId.prefix(8))")
+            changed = true
+        }
+        return changed
     }
 
-    func card(_ w: Waiting, index: Int, hovered: Bool, height H: CGFloat) -> NSView {
-        let view = CardView(frame: NSRect(x: 0, y: 0, width: WIDTH, height: H))
+    func setPanelHeight(_ h: CGFloat) {
+        let L = layout()
+        panel.setFrame(NSRect(x: L.left, y: L.top - h, width: WIDTH, height: h), display: true)
+    }
+
+    // Sets every card's target. The ticker then moves them there.
+    func place(animated: Bool) {
+        if shown.isEmpty { panel.orderOut(nil); hoveredId = nil; return }
+        let hovered = hoveredIndex()
+        hoveredId = hovered.map { shown[$0].sessionId }
+        let now = Date().timeIntervalSinceReferenceDate
+        var y: CGFloat = 0
+        var heights: [Int] = []
+        for (i, w) in shown.enumerated() {
+            let c = cards[w.sessionId]!
+            let h = c.restH + (i == hovered ? c.extraH : 0)
+            heights.append(Int(h))
+            c.targetY = y
+            c.targetH = h
+            c.targetReveal = i == hovered ? 1 : 0
+            c.targetAlpha = 1
+            c.targetAt = (animated && hovered != nil && i > hovered!) ? now + 0.03 * Double(i - hovered!) : 0
+            if !animated || !panel.isVisible { c.jump() }
+            y += h + GAP
+        }
+        dlog("place animated=\(animated) hovered=\(hovered ?? -1) heights=\(heights) panel=\(panel.frame)")
+        if !panel.isVisible { setPanelHeight(y - GAP) }
+        panel.orderFrontRegardless()
+        if ticker == nil {
+            ticker = Timer(timeInterval: 1.0 / 60, repeats: true) { _ in self.tick() }
+            RunLoop.main.add(ticker!, forMode: .common)
+        }
+    }
+
+    func tick() {
+        let now = Date().timeIntervalSinceReferenceDate
+        var moving = false
+        for c in cards.values where c.step(now) { moving = true }
+        // The panel is invisible, so it just stays tall enough for wherever the cards are or are going.
+        let needed = cards.values.map { max($0.curY + $0.curH, $0.targetY + $0.targetH) }.max() ?? 0
+        if abs(panel.frame.height - needed) > 0.5 { setPanelHeight(needed) }
+        // The window shadow is cached from the last shape; without this it lingers as a dark outline while cards move.
+        panel.invalidateShadow()
+        if !moving { ticker?.invalidate(); ticker = nil }
+    }
+
+    func card(_ w: Waiting) -> CardView {
+        let view = CardView(sessionId: w.sessionId)
         view.onHover = { [weak self] in self?.hoverChanged() }
         view.wantsLayer = true
         view.layer?.cornerRadius = RADIUS
@@ -433,6 +548,7 @@ final class Widget: NSObject, NSApplicationDelegate {
         view.layer?.backgroundColor = BODY.cgColor
         view.layer?.borderWidth = boldOutline ? 2.5 : 1
         view.layer?.borderColor = (boldOutline ? outlineColor : NSColor(white: 0.28, alpha: 1)).cgColor
+        view.restH = restH
 
         let live = sessionName(w.sessionId)
         // Unnamed sessions fall back to their first prompt, so the card never repeats the repo name.
@@ -451,28 +567,29 @@ final class Widget: NSObject, NSApplicationDelegate {
         let unit = mins < 60 ? "min" : "hr"
         let needsYou = w.reason == "question" || w.reason == "permission"
         let status = ["done": "Done", "idle": "Idle", "question": "Needs you", "permission": "Permission"][w.reason] ?? "Waiting"
+        let H = restH
 
         if style == "art" {
             let art = CALayer()
-            art.frame = CGRect(x: 0, y: H - ART_HEADER_H, width: WIDTH, height: ART_HEADER_H)
+            art.frame = CGRect(x: 0, y: 0, width: WIDTH, height: ART_HEADER_H)
             art.contents = headerImage(w.kind)
             art.contentsGravity = .resizeAspectFill
             art.masksToBounds = true
             view.layer?.addSublayer(art)
             // The dark body with a folder-style tab rising into the header on the left.
-            let bodyTop = H - ART_HEADER_H
-            let tabTop = bodyTop + 22
+            let bodyTop = ART_HEADER_H
+            let tabTop = bodyTop - 22
             let titleW = NSAttributedString(string: chat, attributes: [.font: font(16, true)]).size().width
             let tabW = min(max(titleW + 46, 140), WIDTH - 96)
             let path = CGMutablePath()
-            path.move(to: CGPoint(x: 0, y: 0))
-            path.addLine(to: CGPoint(x: 0, y: tabTop - RADIUS))
+            path.move(to: CGPoint(x: 0, y: H))
+            path.addLine(to: CGPoint(x: 0, y: tabTop + RADIUS))
             path.addQuadCurve(to: CGPoint(x: RADIUS, y: tabTop), control: CGPoint(x: 0, y: tabTop))
             path.addLine(to: CGPoint(x: tabW - 14, y: tabTop))
             path.addCurve(to: CGPoint(x: tabW + 30, y: bodyTop), control1: CGPoint(x: tabW + 8, y: tabTop), control2: CGPoint(x: tabW + 6, y: bodyTop))
             path.addLine(to: CGPoint(x: WIDTH - RADIUS, y: bodyTop))
-            path.addQuadCurve(to: CGPoint(x: WIDTH, y: bodyTop - RADIUS), control: CGPoint(x: WIDTH, y: bodyTop))
-            path.addLine(to: CGPoint(x: WIDTH, y: 0))
+            path.addQuadCurve(to: CGPoint(x: WIDTH, y: bodyTop + RADIUS), control: CGPoint(x: WIDTH, y: bodyTop))
+            path.addLine(to: CGPoint(x: WIDTH, y: H))
             path.closeSubpath()
             let body = CAShapeLayer()
             body.path = path
@@ -484,14 +601,14 @@ final class Widget: NSObject, NSApplicationDelegate {
         let open = NSButton(title: "", target: self, action: #selector(openClicked(_:)))
         open.isBordered = false
         open.isTransparent = true
-        open.tag = index
-        open.frame = view.bounds
+        open.frame = NSRect(x: 0, y: 0, width: WIDTH, height: H)
+        open.autoresizingMask = [.width, .height]
         view.addSubview(open)
+        view.openButton = open
 
         let go = NSButton(title: "", target: self, action: #selector(openClicked(_:)))
         go.isBordered = false
         go.wantsLayer = true
-        go.tag = index
         go.image = EXTERNAL_LINK_ICON
         go.imagePosition = .imageOnly
         go.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.08).cgColor
@@ -500,7 +617,6 @@ final class Widget: NSObject, NSApplicationDelegate {
         let dismiss = NSButton(title: "", target: self, action: #selector(closeClicked(_:)))
         dismiss.isBordered = false
         dismiss.wantsLayer = true
-        dismiss.tag = index
         dismiss.attributedTitle = NSAttributedString(string: "✕", attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .bold), .foregroundColor: NSColor(white: 0.85, alpha: 1)])
         dismiss.layer?.backgroundColor = (style == "art" ? NSColor.black.withAlphaComponent(0.35) : NSColor.white.withAlphaComponent(0.08)).cgColor
         dismiss.layer?.cornerRadius = 11
@@ -508,7 +624,9 @@ final class Widget: NSObject, NSApplicationDelegate {
         switch style {
         case "compact":
             // Structure 7: dot · name · folder · time, snippet under; hover unfolds the snippet and adds a button row.
-            let dot = NSView(frame: NSRect(x: 16, y: H - 24, width: 8, height: 8))
+            let sh = textHeight(detail, font(12, false), WIDTH - 46, 4)
+            view.extraH = max(0, sh - 15) + 40
+            let dot = NSView(frame: NSRect(x: 16, y: 16, width: 8, height: 8))
             dot.wantsLayer = true
             dot.layer?.cornerRadius = 4
             dot.layer?.backgroundColor = (needsYou ? PINK : NSColor(white: 0.45, alpha: 1)).cgColor
@@ -517,30 +635,28 @@ final class Widget: NSObject, NSApplicationDelegate {
             line.append(NSAttributedString(string: "  ·  " + w.folder, attributes: [.font: font(13, false), .foregroundColor: GREY]))
             let l1 = NSTextField(labelWithAttributedString: line)
             l1.lineBreakMode = .byTruncatingTail
-            l1.frame = NSRect(x: 30, y: H - 29, width: WIDTH - 30 - 16 - 48, height: 18)
+            l1.frame = NSRect(x: 30, y: 11, width: WIDTH - 30 - 16 - 48, height: 18)
             view.addSubview(l1)
-            let t = label("\(big)\(unit == "min" ? "m" : "h")", font(13, true), .white, NSRect(x: WIDTH - 62, y: H - 29, width: 46, height: 18))
+            let t = label("\(big)\(unit == "min" ? "m" : "h")", font(13, true), .white, NSRect(x: WIDTH - 62, y: 11, width: 46, height: 18))
             t.alignment = .right
             view.addSubview(t)
-            if hovered {
-                let sh = textHeight(detail, font(12, false), WIDTH - 46, 4)
-                view.addSubview(wrapped(detail, font(12, false), GREY, NSRect(x: 30, y: H - 31 - sh, width: WIDTH - 46, height: sh)))
-                let meta = NSMutableAttributedString(string: source + "  ·  ", attributes: [.font: font(11, true), .foregroundColor: GREY])
-                meta.append(NSAttributedString(string: status, attributes: [.font: font(11, true), .foregroundColor: needsYou ? PINK : GREY]))
-                let m = NSTextField(labelWithAttributedString: meta)
-                m.frame = NSRect(x: 30, y: 12, width: WIDTH - 30 - 100, height: 16)
-                view.addSubview(m)
-                dismiss.frame = NSRect(x: WIDTH - 84, y: 9, width: 22, height: 22)
-                go.frame = NSRect(x: WIDTH - 48, y: 4, width: 32, height: 32)
-            } else {
-                view.addSubview(label(detail, font(12, false), DIM, NSRect(x: 30, y: H - 31 - 15, width: WIDTH - 46, height: 15)))
-                dismiss.isHidden = true
-                go.isHidden = true
-            }
+            let short = label(detail, font(12, false), DIM, NSRect(x: 30, y: 31, width: WIDTH - 46, height: 15))
+            let full = wrapped(detail, font(12, false), GREY, NSRect(x: 30, y: 31, width: WIDTH - 46, height: sh))
+            view.addSubview(short)
+            view.addSubview(full)
+            view.hide.append(short)
+            let meta = NSMutableAttributedString(string: source + "  ·  ", attributes: [.font: font(11, true), .foregroundColor: GREY])
+            meta.append(NSAttributedString(string: status, attributes: [.font: font(11, true), .foregroundColor: needsYou ? PINK : GREY]))
+            let m = NSTextField(labelWithAttributedString: meta)
+            m.frame = NSRect(x: 30, y: H - 28, width: WIDTH - 30 - 100, height: 16)
+            view.addSubview(m)
+            dismiss.frame = NSRect(x: WIDTH - 84, y: H - 31, width: 22, height: 22)
+            go.frame = NSRect(x: WIDTH - 48, y: H - 36, width: 32, height: 32)
+            view.reveal += [full, m, dismiss, go]
+            view.bottom += [(m, 28), (dismiss, 31), (go, 36)]
         case "art":
-            let tabTop = H - ART_HEADER_H + 22
-            dismiss.frame = NSRect(x: 12, y: H - 32, width: 22, height: 22)
-            let src = label(source, font(13, true), .white, NSRect(x: WIDTH - 176, y: H - 36, width: 160, height: 20))
+            dismiss.frame = NSRect(x: 12, y: 10, width: 22, height: 22)
+            let src = label(source, font(13, true), .white, NSRect(x: WIDTH - 176, y: 16, width: 160, height: 20))
             src.alignment = .right
             let shadow = NSShadow()
             shadow.shadowColor = NSColor.black.withAlphaComponent(0.6)
@@ -549,53 +665,67 @@ final class Widget: NSObject, NSApplicationDelegate {
             view.addSubview(src)
             let titleW = NSAttributedString(string: chat, attributes: [.font: font(16, true)]).size().width
             let tabW = min(max(titleW + 46, 140), WIDTH - 96)
-            view.addSubview(label(chat, font(16, true), .white, NSRect(x: 18, y: tabTop - 28, width: tabW - 36, height: 22)))
-            view.addSubview(label(w.folder, font(13, false), GREY, NSRect(x: 18, y: tabTop - 48, width: WIDTH - 36, height: 18)))
-            let sub = label(detail, font(11, false), DIM, NSRect(x: 18, y: tabTop - 65, width: WIDTH - 36, height: 15))
+            view.addSubview(label(chat, font(16, true), .white, NSRect(x: 18, y: 48, width: tabW - 36, height: 22)))
+            view.addSubview(label(w.folder, font(13, false), GREY, NSRect(x: 18, y: 72, width: WIDTH - 36, height: 18)))
+            let sub = label(detail, font(11, false), DIM, NSRect(x: 18, y: 92, width: WIDTH - 36, height: 15))
             sub.toolTip = detail
             view.addSubview(sub)
-            let bigLabel = label(big, font(24, true), .white, NSRect(x: 16, y: 10, width: 100, height: 30))
+            let bigLabel = label(big, font(24, true), .white, NSRect(x: 16, y: H - 40, width: 100, height: 30))
             bigLabel.sizeToFit()
+            bigLabel.frame.origin.y = H - 40
             view.addSubview(bigLabel)
-            view.addSubview(label(unit, font(12, false), .white, NSRect(x: bigLabel.frame.maxX + 3, y: 13, width: 40, height: 16)))
-            let statusLabel = label(status, font(15, true), needsYou ? PINK : .white, NSRect(x: 100, y: 14, width: WIDTH - 100 - 60, height: 20))
+            view.addSubview(label(unit, font(12, false), .white, NSRect(x: bigLabel.frame.maxX + 3, y: H - 29, width: 40, height: 16)))
+            let statusLabel = label(status, font(15, true), needsYou ? PINK : .white, NSRect(x: 100, y: H - 34, width: WIDTH - 100 - 60, height: 20))
             statusLabel.alignment = .center
             view.addSubview(statusLabel)
-            go.frame = NSRect(x: WIDTH - 48, y: 8, width: 32, height: 32)
+            go.frame = NSRect(x: WIDTH - 48, y: H - 40, width: 32, height: 32)
         default:
             // Structure 1: big minutes first, status beside it, name · folder, snippet, source; buttons only on hover.
-            let bigLabel = label(big, font(26, true), .white, NSRect(x: 16, y: H - 44, width: 100, height: 32))
+            let sh = textHeight(detail, font(12, false), WIDTH - 32, 4)
+            view.extraH = max(0, sh - 16)
+            let bigLabel = label(big, font(26, true), .white, NSRect(x: 16, y: 14, width: 100, height: 32))
             bigLabel.sizeToFit()
+            bigLabel.frame.origin.y = 14
             view.addSubview(bigLabel)
-            let unitLabel = label(unit, font(12, false), .white, NSRect(x: bigLabel.frame.maxX + 3, y: H - 40, width: 40, height: 16))
+            let unitLabel = label(unit, font(12, false), .white, NSRect(x: bigLabel.frame.maxX + 3, y: 24, width: 40, height: 16))
             unitLabel.sizeToFit()
+            unitLabel.frame.origin.y = 24
             view.addSubview(unitLabel)
-            view.addSubview(label(status, font(15, true), needsYou ? PINK : GREY, NSRect(x: unitLabel.frame.maxX + 12, y: H - 41, width: WIDTH - unitLabel.frame.maxX - 12 - 48, height: 20)))
-            dismiss.frame = NSRect(x: WIDTH - 34, y: H - 34, width: 22, height: 22)
+            view.addSubview(label(status, font(15, true), needsYou ? PINK : GREY, NSRect(x: unitLabel.frame.maxX + 12, y: 21, width: WIDTH - unitLabel.frame.maxX - 12 - 48, height: 20)))
+            dismiss.frame = NSRect(x: WIDTH - 38, y: 18, width: 22, height: 22)
             let line = NSMutableAttributedString(string: chat, attributes: [.font: font(14, true), .foregroundColor: NSColor.white])
             line.append(NSAttributedString(string: "  ·  " + w.folder, attributes: [.font: font(13, false), .foregroundColor: GREY]))
             let l2 = NSTextField(labelWithAttributedString: line)
             l2.lineBreakMode = .byTruncatingTail
-            l2.frame = NSRect(x: 16, y: H - 70, width: WIDTH - 32, height: 18)
+            l2.frame = NSRect(x: 16, y: 48, width: WIDTH - 32, height: 18)
             view.addSubview(l2)
-            if hovered {
-                let sh = textHeight(detail, font(12, false), WIDTH - 32, 4)
-                view.addSubview(wrapped(detail, font(12, false), GREY, NSRect(x: 16, y: H - 74 - sh, width: WIDTH - 32, height: sh)))
-            } else {
-                view.addSubview(label(detail, font(12, false), DIM, NSRect(x: 16, y: H - 74 - 16, width: WIDTH - 32, height: 16)))
-                dismiss.isHidden = true
-                go.isHidden = true
-            }
-            view.addSubview(label(source, font(11, true), GREY, NSRect(x: 16, y: 12, width: 200, height: 16)))
-            go.frame = NSRect(x: WIDTH - 48, y: 6, width: 32, height: 32)
+            let short = label(detail, font(12, false), DIM, NSRect(x: 16, y: 70, width: WIDTH - 32, height: 16))
+            let full = wrapped(detail, font(12, false), GREY, NSRect(x: 16, y: 70, width: WIDTH - 32, height: sh))
+            view.addSubview(short)
+            view.addSubview(full)
+            view.hide.append(short)
+            let src = label(source, font(11, true), GREY, NSRect(x: 16, y: H - 34, width: 200, height: 16))
+            view.addSubview(src)
+            go.frame = NSRect(x: WIDTH - 48, y: H - 42, width: 32, height: 32)
+            view.reveal += [full, dismiss, go]
+            view.bottom += [(src, 34), (go, 42)]
         }
         view.addSubview(go)
         view.addSubview(dismiss)
+        view.targetH = H
+        view.render()
         return view
     }
 
+    func cardOf(_ sender: NSView) -> Waiting? {
+        var v: NSView? = sender
+        while let x = v, !(x is CardView) { v = x.superview }
+        guard let id = (v as? CardView)?.sessionId else { return nil }
+        return shown.first { $0.sessionId == id }
+    }
+
     @objc func openClicked(_ sender: NSButton) {
-        let w = shown[sender.tag]
+        guard let w = cardOf(sender) else { return }
         try? FileManager.default.removeItem(atPath: w.path)
         setTabTitle(w)
         openSession(w)
@@ -603,7 +733,8 @@ final class Widget: NSObject, NSApplicationDelegate {
     }
 
     @objc func closeClicked(_ sender: NSButton) {
-        try? FileManager.default.removeItem(atPath: shown[sender.tag].path)
+        guard let w = cardOf(sender) else { return }
+        try? FileManager.default.removeItem(atPath: w.path)
         refresh()
     }
 }
