@@ -26,9 +26,12 @@ cat > "$PLIST" <<PL
     <key>ProcessType</key><string>Interactive</string>
 </dict></plist>
 PL
-launchctl bootout "gui/$(id -u)/com.nishanth.claude-waiting" 2>/dev/null || true
-# bootout returns before the old job is gone; bootstrap fails if it is still there
-until ! launchctl print "gui/$(id -u)/com.nishanth.claude-waiting" >/dev/null 2>&1; do sleep 0.2; done
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+# Registering the agent again would make macOS announce a new "background item" every build, so only
+# register when it is missing; otherwise just restart the running job.
+if launchctl print "gui/$(id -u)/com.nishanth.claude-waiting" >/dev/null 2>&1; then
+    launchctl kickstart -k "gui/$(id -u)/com.nishanth.claude-waiting"
+else
+    launchctl bootstrap "gui/$(id -u)" "$PLIST"
+fi
 sleep 1
 echo "ClaudeWaiting running (pid $(pgrep -f ClaudeWaiting.app/Contents/MacOS/ClaudeWaiting | head -1))"

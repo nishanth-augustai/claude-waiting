@@ -181,7 +181,7 @@ final class CardView: NSView {
     var reveal: [NSView] = []              // visible only while unfolded
     var hide: [NSView] = []                // visible only while folded
     var bottom: [(NSView, CGFloat)] = []   // anchored to the bottom edge: (view, distance from its top to the bottom)
-    var openButton: NSButton? = nil
+    var onOpen: (() -> Void)?
     var curY: CGFloat = 0, curH: CGFloat = 0, curReveal: CGFloat = 0, curAlpha: CGFloat = 0
     var targetY: CGFloat = 0, targetH: CGFloat = 0, targetReveal: CGFloat = 0, targetAlpha: CGFloat = 1
     var targetAt: TimeInterval = 0         // the wave: cards below the unfolded one start a little later
@@ -198,8 +198,14 @@ final class CardView: NSView {
     // Faded-out buttons must not catch clicks meant for the card.
     override func hitTest(_ point: NSPoint) -> NSView? {
         let v = super.hitTest(point)
-        if let v = v, v !== self, v.alphaValue < 0.5 { return openButton }
+        if let v = v, v !== self, v.alphaValue < 0.5 { return self }
         return v
+    }
+    // A click anywhere on the card opens the chat; a drag off the card does nothing.
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { onOpen?() }
     }
     func jump() { curY = targetY; curH = targetH; curReveal = targetReveal; curAlpha = targetAlpha; render() }
     // One frame of motion. Returns true while anything is still moving.
@@ -226,6 +232,37 @@ final class CardView: NSView {
 }
 
 final class FlippedView: NSView { override var isFlipped: Bool { true } }
+
+// A button that brightens on hover and can nudge a little (the Open arrow moves toward its corner).
+final class HoverButton: NSButton {
+    var normalBG = NSColor.white.withAlphaComponent(0.08).cgColor
+    var hoverBG = NSColor.white.withAlphaComponent(0.22).cgColor
+    var nudge = CGSize.zero
+    override func updateTrackingAreas() {
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil))
+        super.updateTrackingAreas()
+    }
+    override func mouseEntered(with event: NSEvent) { set(hover: true) }
+    override func mouseExited(with event: NSEvent) { set(hover: false) }
+    func set(hover: Bool) {
+        guard let l = layer else { return }
+        let bg = hover ? hoverBG : normalBG
+        let t = hover ? CATransform3DMakeTranslation(nudge.width, nudge.height, 0) : CATransform3DIdentity
+        // AppKit turns implicit layer animations off, so animate by hand from wherever the layer is right now.
+        for (key, from, to) in [("backgroundColor", l.presentation()?.backgroundColor ?? l.backgroundColor, bg as Any),
+                                ("transform", l.presentation()?.transform ?? l.transform, t as Any)] {
+            let a = CABasicAnimation(keyPath: key)
+            a.fromValue = from
+            a.toValue = to
+            a.duration = 0.14
+            a.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0, 0, 1)
+            l.add(a, forKey: key)
+        }
+        l.backgroundColor = bg
+        l.transform = t
+    }
+}
 
 let PINK = NSColor(red: 1, green: 0.42, blue: 0.62, alpha: 1)
 let GREY = NSColor.white.withAlphaComponent(0.55)
@@ -598,27 +635,23 @@ final class Widget: NSObject, NSApplicationDelegate {
         }
 
         // Whole card opens the session; the ✕ dismisses it.
-        let open = NSButton(title: "", target: self, action: #selector(openClicked(_:)))
-        open.isBordered = false
-        open.isTransparent = true
-        open.frame = NSRect(x: 0, y: 0, width: WIDTH, height: H)
-        open.autoresizingMask = [.width, .height]
-        view.addSubview(open)
-        view.openButton = open
+        view.onOpen = { [weak self] in self?.open(w.sessionId) }
 
-        let go = NSButton(title: "", target: self, action: #selector(openClicked(_:)))
+        let go = HoverButton(title: "", target: self, action: #selector(openClicked(_:)))
         go.isBordered = false
         go.wantsLayer = true
         go.image = EXTERNAL_LINK_ICON
         go.imagePosition = .imageOnly
-        go.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.08).cgColor
+        go.layer?.backgroundColor = go.normalBG
         go.layer?.cornerRadius = 9
+        go.nudge = CGSize(width: 2, height: -2)
 
-        let dismiss = NSButton(title: "", target: self, action: #selector(closeClicked(_:)))
+        let dismiss = HoverButton(title: "", target: self, action: #selector(closeClicked(_:)))
         dismiss.isBordered = false
         dismiss.wantsLayer = true
         dismiss.attributedTitle = NSAttributedString(string: "✕", attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .bold), .foregroundColor: NSColor(white: 0.85, alpha: 1)])
-        dismiss.layer?.backgroundColor = (style == "art" ? NSColor.black.withAlphaComponent(0.35) : NSColor.white.withAlphaComponent(0.08)).cgColor
+        if style == "art" { dismiss.normalBG = NSColor.black.withAlphaComponent(0.35).cgColor; dismiss.hoverBG = NSColor.black.withAlphaComponent(0.7).cgColor }
+        dismiss.layer?.backgroundColor = dismiss.normalBG
         dismiss.layer?.cornerRadius = 11
 
         switch style {
@@ -724,8 +757,11 @@ final class Widget: NSObject, NSApplicationDelegate {
         return shown.first { $0.sessionId == id }
     }
 
-    @objc func openClicked(_ sender: NSButton) {
-        guard let w = cardOf(sender) else { return }
+    @objc func openClicked(_ sender: NSButton) { if let w = cardOf(sender) { open(w.sessionId) } }
+
+    func open(_ id: String) {
+        guard let w = shown.first(where: { $0.sessionId == id }) else { return }
+        dlog("open \(id.prefix(8))")
         try? FileManager.default.removeItem(atPath: w.path)
         setTabTitle(w)
         openSession(w)
