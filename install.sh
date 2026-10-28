@@ -8,7 +8,6 @@ done
 
 ./build.sh
 [ -d ClaudeJump.app ] || ./build-jump.sh
-./vscode-ext/build-vsix.sh
 code --install-extension claude-waiting-focus.vsix --force >/dev/null 2>&1 || true
 
 # Claude Code hooks: drop older entries for this hook, then add the current ones.

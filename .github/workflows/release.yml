@@ -1,0 +1,17 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./build-jump.sh
+      - run: ./build.sh
+      - run: ditto -c -k --keepParent ClaudeWaiting.app ClaudeWaiting.zip
+      - run: gh release create "$GITHUB_REF_NAME" ClaudeWaiting.zip --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
