@@ -277,7 +277,7 @@ let t0 = Date()
 let dlog = { (s: String) in if DEBUG { print(String(format: "%7.3f ", Date().timeIntervalSince(t0)) + s) } }
 var frameNo = 0
 let captureFrame = { (panel: NSPanel) in
-    guard panel.isVisible, let view = panel.contentView, let rep = view.bitmapImageRepForCachingDisplay(view.bounds) else { return }
+    guard panel.isVisible, let view = panel.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
     view.cacheDisplay(in: view.bounds, to: rep)
     guard let png = rep.representation(using: .png, properties: [:]) else { return }
     let dir = DIR + "/frames"
