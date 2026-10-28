@@ -19,6 +19,35 @@ Needs macOS 13+ and `jq` (built into macOS 15; otherwise `brew install jq`).
 A bell icon appears in the menu bar. From there: card style (Default, Compact, Art), thin or bold
 outline, outline colour, start at login, re-run setup, quit.
 
+## Let an AI set it up
+
+Paste this into Claude Code (or any agent with a shell) and it can do the whole install except the two
+clicks macOS reserves for a human.
+
+> Install the Claude Waiting widget from https://github.com/nishanth-augustai/claude-waiting for me.
+> Steps:
+> 1. Download `ClaudeWaiting.zip` from the latest release, unzip it, and move `ClaudeWaiting.app` to /Applications.
+>    `curl -L -o /tmp/ClaudeWaiting.zip https://github.com/nishanth-augustai/claude-waiting/releases/latest/download/ClaudeWaiting.zip && ditto -x -k /tmp/ClaudeWaiting.zip /Applications`
+> 2. It is ad-hoc signed, not notarized. Clear the quarantine flag so it opens without the right-click dance:
+>    `xattr -dr com.apple.quarantine /Applications/ClaudeWaiting.app`
+> 3. Add the hooks to `~/.claude/settings.json`. Back the file up first. Remove any existing entries whose
+>    command mentions `claude-waiting` or `ClaudeWaiting.app`, then add one entry per event, each running
+>    `"/Applications/ClaudeWaiting.app/Contents/Resources/hook" <event>`:
+>    SessionStart→start, UserPromptSubmit→prompt, Stop→stop, Notification→notify, SessionEnd→end,
+>    PreToolUse→question and PostToolUse→answered (both with matcher `AskUserQuestion`).
+>    Also set `env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE` to `"1"`. `install.sh` in the repo shows the exact jq.
+> 4. Install the VS Code extension and tab settings:
+>    `code --install-extension /Applications/ClaudeWaiting.app/Contents/Resources/claude-waiting-focus.vsix --force`
+>    and in VS Code's settings.json set `"terminal.integrated.tabs.title": "${process}"` and
+>    `"terminal.integrated.tabs.description": "${sequence}"`.
+> 5. Check `jq` is on PATH (the hook needs it): `which jq || brew install jq`.
+> 6. Start it: `open /Applications/ClaudeWaiting.app`. If it asks to set itself up, the hooks are already in
+>    place, so "Not now" is fine. In the menu bar bell icon, turn on "Start at login".
+> 7. Verify: `tail -3 ~/.claude-waiting/hook.log` after starting a new Claude session should show a `start` line.
+> Then tell me the two things only I can do: reload my VS Code windows and restart my Claude sessions, and,
+> if I use iTerm2 or Terminal.app, add `/Applications/ClaudeWaiting.app/Contents/Helpers/ClaudeJump.app`
+> under System Settings › Privacy & Security › Accessibility.
+
 ## Install (from source)
 
 Needs Xcode command line tools, `jq`, and the `code` CLI.
